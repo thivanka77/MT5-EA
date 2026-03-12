@@ -5,10 +5,11 @@
 //|  Two modes: Market Order & Limit Order                             |
 //|  Auto-calculates lot size from Risk %, SL distance, tick value     |
 //|  Graphical panel with Buy/Sell buttons and confirmation dialog     |
+//|  Break-Even SL: moves SL to entry when profit trigger is reached   |
 //+------------------------------------------------------------------+
 #property copyright "Position Sizer EA"
-#property version   "1.00"
-#property description "Risk-based position sizing with Market & Limit order modes"
+#property version   "1.10"
+#property description "Risk-based position sizing with Market & Limit order modes + Break-Even SL"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -44,6 +45,11 @@ input double           InpDefaultEntry    = 0.0;        // Default Entry Price (
 input double           InpDefaultSLPrice  = 0.0;        // Default SL Price
 input double           InpDefaultTPPrice  = 0.0;        // Default TP Price (0=none)
 
+input group "=== Break-Even Defaults ==="
+input bool             InpDefaultBEOn     = false;       // Break-Even enabled by default
+input int              InpDefaultBETicks  = 50;          // BE Trigger (ticks in profit)
+input double           InpDefaultBEPrice  = 0.0;         // BE Trigger Price (0=use ticks)
+
 //+------------------------------------------------------------------+
 //| Global Variables                                                   |
 //+------------------------------------------------------------------+
@@ -51,7 +57,7 @@ CTrade trade;
 
 // Panel dimensions
 const int PANEL_W        = 320;
-const int PANEL_H        = 420;
+const int PANEL_H        = 520;
 const int FIELD_H        = 22;
 const int LABEL_W        = 130;
 const int INPUT_W        = 160;
@@ -71,6 +77,11 @@ double g_tpPrice;
 bool   g_confirmShowing = false;
 int    g_confirmDirection = 0; // 1=buy, -1=sell
 
+// Break-Even state
+bool   g_beEnabled;
+int    g_beTicks;
+double g_bePrice;
+
 // Object name prefixes
 const string PFX = "PS_";
 
@@ -87,6 +98,11 @@ int OnInit()
    g_entryPrice = InpDefaultEntry;
    g_slPrice    = InpDefaultSLPrice;
    g_tpPrice    = InpDefaultTPPrice;
+
+   // Break-Even
+   g_beEnabled  = InpDefaultBEOn;
+   g_beTicks    = InpDefaultBETicks;
+   g_bePrice    = InpDefaultBEPrice;
 
    // Enable chart events
    ChartSetInteger(0, CHART_EVENT_MOUSE_MOVE, true);
@@ -113,6 +129,7 @@ void OnDeinit(const int reason)
 void OnTick()
   {
    UpdatePanel();
+   CheckBreakEven();
   }
 
 //+------------------------------------------------------------------+
@@ -174,7 +191,7 @@ void CreatePanel()
    CreateRect(PFX + "Sep2", x + MARGIN, row, PANEL_W - 2 * MARGIN, 1, clrGray);
    row += 8;
 
-   // --- Input Fields (Market Mode) ---
+   // --- Input Fields ---
    // Risk %
    CreateLabel(PFX + "LblRisk", x + MARGIN, row, "Risk %:", InpTextColor, 9, false);
    CreateEdit(PFX + "EdtRisk", x + MARGIN + LABEL_W + 10, row, INPUT_W, FIELD_H,
@@ -224,19 +241,51 @@ void CreatePanel()
    CreateLabel(PFX + "LblWarn", x + MARGIN, row, "", clrOrangeRed, 8, false);
    row += ROW_H;
 
+   // --- Separator ---
+   CreateRect(PFX + "Sep4", x + MARGIN, row, PANEL_W - 2 * MARGIN, 1, clrGray);
+   row += 8;
+
+   // --- Break-Even Section ---
+   CreateLabel(PFX + "LblBETitle", x + MARGIN, row, "BREAK EVEN", InpTextColor, 9, true);
+   CreateButton(PFX + "BtnBE", x + MARGIN + 100, row - 2, 70, 24,
+                g_beEnabled ? "ON" : "OFF",
+                g_beEnabled ? clrGreen : clrGray);
+   row += ROW_H;
+
+   CreateLabel(PFX + "LblBETicks", x + MARGIN, row, "BE Trigger (ticks):", InpTextColor, 9, false);
+   CreateEdit(PFX + "EdtBETicks", x + MARGIN + LABEL_W + 10, row, INPUT_W, FIELD_H,
+              IntegerToString(g_beTicks));
+   row += ROW_H;
+
+   CreateLabel(PFX + "LblBEPrice", x + MARGIN, row, "BE Trigger Price:", InpTextColor, 9, false);
+   CreateEdit(PFX + "EdtBEPrice", x + MARGIN + LABEL_W + 10, row, INPUT_W, FIELD_H,
+              (g_bePrice > 0) ? DoubleToString(g_bePrice, _Digits) : "0");
+   row += ROW_H;
+
+   CreateLabel(PFX + "LblBEStatus", x + MARGIN, row, "BE Status:", InpTextColor, 9, false);
+   CreateLabel(PFX + "ValBEStatus", x + MARGIN + LABEL_W + 10, row,
+              g_beEnabled ? "Monitoring..." : "Disabled",
+              g_beEnabled ? clrLime : clrGray, 9, false);
+   row += ROW_H;
+
+   // --- Separator ---
+   CreateRect(PFX + "Sep5", x + MARGIN, row, PANEL_W - 2 * MARGIN, 1, clrGray);
+   row += 8;
+
    // --- Buy / Sell Buttons ---
    CreateButton(PFX + "BtnBuy", x + MARGIN, row, BTN_W, BTN_H + 4, "BUY", InpBuyColor);
    CreateButton(PFX + "BtnSell", x + MARGIN + BTN_W + 10, row, BTN_W, BTN_H + 4, "SELL", InpSellColor);
    row += BTN_H + 14;
 
    // --- Confirmation overlay (hidden by default) ---
-   CreateRect(PFX + "ConfBG", x + 10, y + PANEL_H / 2 - 60, PANEL_W - 20, 120, clrBlack);
-   CreateLabel(PFX + "ConfText1", x + 20, y + PANEL_H / 2 - 50, "", clrWhite, 9, false);
-   CreateLabel(PFX + "ConfText2", x + 20, y + PANEL_H / 2 - 30, "", clrWhite, 9, false);
-   CreateLabel(PFX + "ConfText3", x + 20, y + PANEL_H / 2 - 10, "", clrWhite, 9, false);
-   CreateLabel(PFX + "ConfText4", x + 20, y + PANEL_H / 2 + 10, "", clrYellow, 9, true);
-   CreateButton(PFX + "BtnConfirm", x + 20, y + PANEL_H / 2 + 32, 120, BTN_H, "CONFIRM", clrGreen);
-   CreateButton(PFX + "BtnCancel", x + 160, y + PANEL_H / 2 + 32, 120, BTN_H, "CANCEL", clrGray);
+   CreateRect(PFX + "ConfBG", x + 10, y + PANEL_H / 2 - 70, PANEL_W - 20, 140, clrBlack);
+   CreateLabel(PFX + "ConfText1", x + 20, y + PANEL_H / 2 - 60, "", clrWhite, 9, false);
+   CreateLabel(PFX + "ConfText2", x + 20, y + PANEL_H / 2 - 40, "", clrWhite, 9, false);
+   CreateLabel(PFX + "ConfText3", x + 20, y + PANEL_H / 2 - 20, "", clrWhite, 9, false);
+   CreateLabel(PFX + "ConfText4", x + 20, y + PANEL_H / 2 + 0, "", clrYellow, 9, true);
+   CreateLabel(PFX + "ConfText5", x + 20, y + PANEL_H / 2 + 20, "", clrLime, 8, false);
+   CreateButton(PFX + "BtnConfirm", x + 20, y + PANEL_H / 2 + 42, 120, BTN_H, "CONFIRM", clrGreen);
+   CreateButton(PFX + "BtnCancel", x + 160, y + PANEL_H / 2 + 42, 120, BTN_H, "CANCEL", clrGray);
 
    ShowConfirmation(false);
    SetModeVisibility();
@@ -324,7 +373,119 @@ void UpdatePanel()
 
    ObjectSetString(0, PFX + "LblWarn", OBJPROP_TEXT, warning);
 
+   // Update BE status display
+   if(g_beEnabled)
+     {
+      // Don't overwrite "BE applied" messages — only reset to Monitoring if not already applied
+      string currentStatus = ObjectGetString(0, PFX + "ValBEStatus", OBJPROP_TEXT);
+      if(StringFind(currentStatus, "BE applied") < 0)
+        {
+         ObjectSetString(0, PFX + "ValBEStatus", OBJPROP_TEXT, "Monitoring...");
+         ObjectSetInteger(0, PFX + "ValBEStatus", OBJPROP_COLOR, clrLime);
+        }
+     }
+   else
+     {
+      ObjectSetString(0, PFX + "ValBEStatus", OBJPROP_TEXT, "Disabled");
+      ObjectSetInteger(0, PFX + "ValBEStatus", OBJPROP_COLOR, clrGray);
+     }
+
    ChartRedraw();
+  }
+
+//+------------------------------------------------------------------+
+//| Check and apply Break-Even SL for open positions                   |
+//+------------------------------------------------------------------+
+void CheckBreakEven()
+  {
+   if(!g_beEnabled)
+      return;
+
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize <= 0)
+      return;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      // Only manage positions on the current symbol
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      // Only manage positions placed by this EA (check comment)
+      string comment = PositionGetString(POSITION_COMMENT);
+      if(StringFind(comment, "PositionSizer") < 0)
+         continue;
+
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+      long   posType   = PositionGetInteger(POSITION_TYPE);
+
+      // Skip if SL is already at or beyond entry (break-even already applied)
+      if(posType == POSITION_TYPE_BUY && currentSL >= openPrice)
+         continue;
+      if(posType == POSITION_TYPE_SELL && currentSL > 0 && currentSL <= openPrice)
+         continue;
+
+      // Determine the trigger price for this position
+      // If user set a specific BE trigger price, use it; otherwise use ticks
+      double triggerPrice = 0;
+
+      if(g_bePrice > 0)
+        {
+         // User specified an explicit trigger price — use it directly
+         triggerPrice = g_bePrice;
+        }
+      else
+        {
+         // Calculate trigger from ticks relative to entry
+         double triggerDistance = g_beTicks * tickSize;
+         if(posType == POSITION_TYPE_BUY)
+            triggerPrice = openPrice + triggerDistance;
+         else
+            triggerPrice = openPrice - triggerDistance;
+        }
+
+      // Check if current price has reached the trigger
+      double currentPrice = 0;
+      if(posType == POSITION_TYPE_BUY)
+         currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      else
+         currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+      bool triggered = false;
+      if(posType == POSITION_TYPE_BUY && currentPrice >= triggerPrice)
+         triggered = true;
+      if(posType == POSITION_TYPE_SELL && currentPrice <= triggerPrice)
+         triggered = true;
+
+      if(triggered)
+        {
+         // Move SL to entry price (break-even)
+         double newSL = NormalizeDouble(openPrice, _Digits);
+
+         if(trade.PositionModify(ticket, newSL, currentTP))
+           {
+            string dirStr = (posType == POSITION_TYPE_BUY) ? "Buy" : "Sell";
+            Print("Break-Even applied: ", dirStr, " #", ticket,
+                  " SL moved to entry ", DoubleToString(newSL, _Digits));
+
+            // Update status on panel
+            ObjectSetString(0, PFX + "ValBEStatus", OBJPROP_TEXT,
+                           "BE applied #" + IntegerToString((int)ticket));
+            ObjectSetInteger(0, PFX + "ValBEStatus", OBJPROP_COLOR, clrYellow);
+           }
+         else
+           {
+            Print("Break-Even modify failed for #", ticket,
+                  " Error: ", GetLastError());
+           }
+        }
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -386,6 +547,17 @@ void HandleClick(const string objName)
       return;
      }
 
+   // Break-Even toggle
+   if(objName == PFX + "BtnBE")
+     {
+      g_beEnabled = !g_beEnabled;
+      ObjectSetString(0, PFX + "BtnBE", OBJPROP_TEXT, g_beEnabled ? "ON" : "OFF");
+      ObjectSetInteger(0, PFX + "BtnBE", OBJPROP_BGCOLOR, g_beEnabled ? clrGreen : clrGray);
+      ObjectSetInteger(0, PFX + "BtnBE", OBJPROP_STATE, false);
+      UpdatePanel();
+      return;
+     }
+
    // Buy / Sell
    if(objName == PFX + "BtnBuy")
      {
@@ -438,6 +610,13 @@ void HandleEditEnd(const string objName)
 
    if(objName == PFX + "EdtTPPrice")
       g_tpPrice = StringToDouble(ObjectGetString(0, objName, OBJPROP_TEXT));
+
+   // Break-Even fields
+   if(objName == PFX + "EdtBETicks")
+      g_beTicks = (int)StringToInteger(ObjectGetString(0, objName, OBJPROP_TEXT));
+
+   if(objName == PFX + "EdtBEPrice")
+      g_bePrice = StringToDouble(ObjectGetString(0, objName, OBJPROP_TEXT));
   }
 
 //+------------------------------------------------------------------+
@@ -510,6 +689,19 @@ void ShowOrderConfirmation(int direction)
                    "Risk: " + DoubleToString(g_riskPct, 2) + "% = " +
                    DoubleToString(riskAmt, 2) + " " + AccountInfoString(ACCOUNT_CURRENCY));
 
+   // Show BE info in confirmation
+   if(g_beEnabled)
+     {
+      string beInfo = "Break-Even: ON | Trigger: ";
+      if(g_bePrice > 0)
+         beInfo += DoubleToString(g_bePrice, _Digits);
+      else
+         beInfo += IntegerToString(g_beTicks) + " ticks";
+      ObjectSetString(0, PFX + "ConfText5", OBJPROP_TEXT, beInfo);
+     }
+   else
+      ObjectSetString(0, PFX + "ConfText5", OBJPROP_TEXT, "Break-Even: OFF");
+
    ShowConfirmation(true);
   }
 
@@ -524,6 +716,7 @@ void ShowConfirmation(bool show)
    SetObjVisible(PFX + "ConfText2",   show);
    SetObjVisible(PFX + "ConfText3",   show);
    SetObjVisible(PFX + "ConfText4",   show);
+   SetObjVisible(PFX + "ConfText5",   show);
    SetObjVisible(PFX + "BtnConfirm",  show);
    SetObjVisible(PFX + "BtnCancel",   show);
   }
@@ -736,7 +929,6 @@ void SetObjVisible(const string name, bool visible)
   {
    if(ObjectFind(0, name) < 0)
       return;
-   // Use timeframes visibility: 0 = hidden on all, OBJ_ALL_PERIODS = visible
    ObjectSetInteger(0, name, OBJPROP_TIMEFRAMES, visible ? OBJ_ALL_PERIODS : OBJ_NO_PERIODS);
   }
 //+------------------------------------------------------------------+
