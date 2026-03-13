@@ -57,7 +57,7 @@ CTrade trade;
 
 // Panel dimensions
 const int PANEL_W        = 320;
-const int PANEL_H        = 520;
+const int PANEL_H        = 576;
 const int FIELD_H        = 22;
 const int LABEL_W        = 130;
 const int INPUT_W        = 160;
@@ -187,6 +187,14 @@ void CreatePanel()
    CreateLabel(PFX + "ValSymbol", x + MARGIN + LABEL_W + 10, row, _Symbol, clrLime, 9, true);
    row += ROW_H;
 
+   CreateLabel(PFX + "LblContract", x + MARGIN, row, "Contract Size:", InpTextColor, 9, false);
+   CreateLabel(PFX + "ValContract", x + MARGIN + LABEL_W + 10, row, "---", clrLime, 9, true);
+   row += ROW_H;
+
+   CreateLabel(PFX + "LblTickInfo", x + MARGIN, row, "Tick Size / Value:", InpTextColor, 9, false);
+   CreateLabel(PFX + "ValTickInfo", x + MARGIN + LABEL_W + 10, row, "---", clrLime, 9, true);
+   row += ROW_H;
+
    // --- Separator ---
    CreateRect(PFX + "Sep2", x + MARGIN, row, PANEL_W - 2 * MARGIN, 1, clrGray);
    row += 8;
@@ -302,19 +310,37 @@ void UpdatePanel()
    ObjectSetString(0, PFX + "ValAcct", OBJPROP_TEXT,
                    DoubleToString(balance, 2) + " " + currency);
 
+   // Auto-detect symbol properties from broker specifications
+   double contractSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+   double tickSize     = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue    = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+
+   // Display contract size and tick info for verification
+   ObjectSetString(0, PFX + "ValContract", OBJPROP_TEXT,
+                   DoubleToString(contractSize, 2));
+   ObjectSetString(0, PFX + "ValTickInfo", OBJPROP_TEXT,
+                   DoubleToString(tickSize, _Digits) + " / " +
+                   DoubleToString(tickValue, 4) + " " + currency);
+
+   // Calculate monetary value per tick per lot
+   // MT5's SYMBOL_TRADE_TICK_VALUE = contractSize * tickSize / <conversion>
+   // This already accounts for contract size and currency conversion
+   // So: loss per lot = numberOfTicks * tickValue
+   double moneyPerTickPerLot = tickValue;  // already includes contract size
+
    // Calculate and display lot size
    double lots = 0;
    string warning = "";
    bool   clamped = false;
+   double slTotalTicks = 0;
 
    if(g_mode == MODE_MARKET)
      {
-      double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-      double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-      if(g_slTicks > 0 && tickValue > 0 && tickSize > 0)
+      slTotalTicks = g_slTicks;
+      if(slTotalTicks > 0 && moneyPerTickPerLot > 0)
         {
-         double riskMoney    = balance * g_riskPct / 100.0;
-         double slMoneyPerLot = g_slTicks * tickValue;
+         double riskMoney     = balance * g_riskPct / 100.0;
+         double slMoneyPerLot = slTotalTicks * moneyPerTickPerLot;
          lots = riskMoney / slMoneyPerLot;
          lots = ClampLots(lots, clamped);
          if(clamped)
@@ -327,15 +353,14 @@ void UpdatePanel()
      }
    else // LIMIT mode
      {
-      if(g_entryPrice > 0 && g_slPrice > 0 && MathAbs(g_entryPrice - g_slPrice) > 0)
+      if(g_entryPrice > 0 && g_slPrice > 0 && tickSize > 0 &&
+         MathAbs(g_entryPrice - g_slPrice) > 0)
         {
-         double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-         double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-         if(tickSize > 0 && tickValue > 0)
+         slTotalTicks = MathAbs(g_entryPrice - g_slPrice) / tickSize;
+         if(moneyPerTickPerLot > 0)
            {
-            double slDistanceTicks = MathAbs(g_entryPrice - g_slPrice) / tickSize;
-            double riskMoney       = balance * g_riskPct / 100.0;
-            double slMoneyPerLot   = slDistanceTicks * tickValue;
+            double riskMoney     = balance * g_riskPct / 100.0;
+            double slMoneyPerLot = slTotalTicks * moneyPerTickPerLot;
             if(slMoneyPerLot > 0)
               {
                lots = riskMoney / slMoneyPerLot;
@@ -351,23 +376,13 @@ void UpdatePanel()
         }
      }
 
-   // Display
+   // Display lot size
    ObjectSetString(0, PFX + "ValCalcLots", OBJPROP_TEXT,
                    (lots > 0) ? DoubleToString(lots, 2) : "---");
 
-   double riskAmt = 0;
-   if(lots > 0)
-     {
-      double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-      if(g_mode == MODE_MARKET)
-         riskAmt = lots * g_slTicks * tickValue;
-      else
-        {
-         double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-         if(tickSize > 0)
-            riskAmt = lots * (MathAbs(g_entryPrice - g_slPrice) / tickSize) * tickValue;
-        }
-     }
+   // Display risk amount
+   double riskAmt = (lots > 0 && slTotalTicks > 0) ?
+                    lots * slTotalTicks * moneyPerTickPerLot : 0;
    ObjectSetString(0, PFX + "ValCalcRisk", OBJPROP_TEXT,
                    (riskAmt > 0) ? (DoubleToString(riskAmt, 2) + " " + currency) : "---");
 
@@ -376,7 +391,6 @@ void UpdatePanel()
    // Update BE status display
    if(g_beEnabled)
      {
-      // Don't overwrite "BE applied" messages — only reset to Monitoring if not already applied
       string currentStatus = ObjectGetString(0, PFX + "ValBEStatus", OBJPROP_TEXT);
       if(StringFind(currentStatus, "BE applied") < 0)
         {
@@ -729,6 +743,9 @@ double CalculateLots()
    double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
    double tickSize   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    double tickValue  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   // tickValue from MT5 = monetary value of 1 tick movement for 1 standard lot
+   // It already incorporates contract size and currency conversion
+   // Formula: lots = riskMoney / (slTicks * tickValue)
    double riskMoney  = balance * g_riskPct / 100.0;
    double lots       = 0;
    bool   clamped    = false;
